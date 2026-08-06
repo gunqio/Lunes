@@ -282,7 +282,7 @@ def clear_browser_state(sb):
 
 
 def handle_initial_page(sb, email: str) -> Optional[str]:
-    clear_browser_state()
+    clear_browser_state(sb)
 
     logger.info("访问登录页...")
     sb.uc_open_with_reconnect(BETADASH_LOGIN_URL, reconnect_time=8)
