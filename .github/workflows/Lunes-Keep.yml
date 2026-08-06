@@ -53,16 +53,16 @@ jobs:
           LUNES: ${{ secrets.LUNES }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PROXY_SERVER: ${{ env.PROXY_SERVER }}    # 由 setup_proxy.sh 写入格式:socks5://127.0.0.1:1080
+          PROXY_SERVER: ${{ env.PROXY_SERVER }}
         run: python scripts/Lunes-Keep.py
 
-#      - name: 上传截图
-#        uses: actions/upload-artifact@v4
-#        if: always()
-#        with:
-#          name: screenshots-${{ github.run_number }}
-#          path: output/screenshots/
-#          retention-days: 3
+      - name: 上传截图
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: output/screenshots/
+          retention-days: 3
 
       - name: 清理旧运行
         uses: Mattraks/delete-workflow-runs@v2
