@@ -1,0 +1,74 @@
+name: Lunes Host 自动保活
+
+on:
+  schedule:
+    # 每10天运行：1号、11号、21号 中午12:12 (北京时间)
+    # UTC 时间 = 北京时间 - 8小时 = 04:12
+    - cron: '12 4 1,11,21 * *'
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    name: 执行保活
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    concurrency:
+      group: lunes-keepalive
+      cancel-in-progress: false
+
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb
+          pip install seleniumbase>=4.25.0 pyvirtualdisplay>=3.0 requests>=2.31.0
+
+      - name: 设置代理
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          chmod +x scripts/setup_proxy.sh
+          if ! bash scripts/setup_proxy.sh; then
+            echo "❌ 代理设置失败，发送通知..."
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT_ID}" \
+              -d text="❌ Lunes Host 自动保活失败：代理不可用" \
+              --max-time 10 || true
+            exit 1
+          fi
+
+      - name: 执行保活
+        env:
+          LUNES: ${{ secrets.LUNES }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PROXY_SERVER: ${{ env.PROXY_SERVER }}    # 由 setup_proxy.sh 写入格式:socks5://127.0.0.1:1080
+        run: python scripts/Lunes-Keep.py
+
+#      - name: 上传截图
+#        uses: actions/upload-artifact@v4
+#        if: always()
+#        with:
+#          name: screenshots-${{ github.run_number }}
+#          path: output/screenshots/
+#          retention-days: 3
+
+      - name: 清理旧运行
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
+          retain_days: 0
+          keep_minimum_runs: 3
