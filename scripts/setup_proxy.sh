@@ -1,192 +1,454 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+# setup_proxy.sh - 代理节点解析与 sing-box 启动
+export LC_ALL=C
+set -e
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+# 默认测试节点（可通过环境变量覆盖）
+export NODE_LINK=${NODE_LINK:-''}
 
-get_singbox() {
-    info "获取 sing-box 最新版本..."
-    local ver
-    ver=$(curl -sL --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep -oP '"tag_name": "\K[^"]+' || true)
-    ver="${ver:-v1.13.16}"
-    info "版本: $ver"
-    local v="${ver#v}"
-    curl -sL --max-time 60 "https://github.com/SagerNet/sing-box/releases/download/${ver}/sing-box-${v}-linux-amd64.tar.gz" | tar -xz -C /tmp "sing-box-${v}-linux-amd64/sing-box" 2>/dev/null || return 1
-    mv "/tmp/sing-box-${v}-linux-amd64/sing-box" /usr/local/bin/sing-box
-    chmod +x /usr/local/bin/sing-box
+if [ -z "$NODE_LINK" ]; then
+  echo "[INFO] 未配置代理，直连模式"
+  echo "IS_PROXY=false" >> $GITHUB_ENV
+  exit 0
+fi
+
+if ! command -v jq &> /dev/null; then
+  sudo apt-get update -qq && sudo apt-get install -y -qq jq > /dev/null 2>&1
+fi
+
+command -v curl &>/dev/null && COMMAND="curl -so" || command -v wget &>/dev/null && COMMAND="wget -qO" || { red "Error: neither curl nor wget found, please install one of them." >&2; exit 1; }
+
+echo "[INFO] sing-box 版本: v1.13.7 (hardcoded)"
+latest_version=1.13.7
+
+ARCH_RAW=$(uname -m)
+case "${ARCH_RAW}" in
+    'x86_64' | 'amd64')  ARCH='amd64' ;;
+    'x86' | 'i686' | 'i386') ARCH='386' ;;
+    'aarch64' | 'arm64') ARCH='arm64' ;;
+    'armv7l')  ARCH='armv7' ;;
+    's390x')   ARCH='s390x' ;;
+    *) echo "不支持的架构: ${ARCH_RAW}"; exit 1 ;;
+esac
+
+$COMMAND sing-box-${latest_version}-linux-${ARCH}.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz"
+tar -xzf "sing-box-${latest_version}-linux-${ARCH}.tar.gz"
+mv "sing-box-${latest_version}-linux-${ARCH}/sing-box" ./
+rm -f "sing-box-${latest_version}-linux-${ARCH}.tar.gz"
+rm -rf "sing-box-${latest_version}-linux-${ARCH}"
+chmod +x sing-box
+
+proto=$(echo "$NODE_LINK" | cut -d':' -f1)
+content="${NODE_LINK#*://}"
+content="${content%%#*}"
+
+echo "[INFO] 协议: $proto"
+# echo "[INFO] 原始内容: $content"
+
+# 初始化变量
+outbound_type=""
+outbound_server=""
+outbound_port=""
+outbound_uuid=""
+outbound_flow=""
+outbound_transport_type="tcp"
+outbound_path="/"
+outbound_host=""
+outbound_security="none"
+outbound_sni=""
+outbound_fingerprint="chrome"
+outbound_reality_pbk=""
+outbound_reality_sid=""
+outbound_password=""
+outbound_up_mbps=100
+outbound_down_mbps=100
+outbound_obfs_password=""
+outbound_auth=""
+outbound_congestion="bbr"
+outbound_udp_over_stream="true"
+outbound_zerortt="false"
+outbound_username=""
+outbound_password2=""
+outbound_version="5"
+outbound_insecure="false"
+outbound_alpn=""
+
+# 辅助函数：URL 解码
+url_decode() {
+  local encoded="$1"
+  printf '%b' "$(echo "$encoded" | sed 's/%/\\x/g')"
 }
 
-# 测试代理，测试通过后保留 sing-box 后台运行
-test_proxy() {
-    # 清理可能存在的旧进程
-    if [ -f /tmp/sing-box.pid ]; then
-        kill $(cat /tmp/sing-box.pid) 2>/dev/null || true
-        rm -f /tmp/sing-box.pid
+case "$proto" in
+  vless)
+    uuid_host="${content#*://}"
+    uuid="${uuid_host%%@*}"
+    rest="${uuid_host#*@}"
+    if [[ "$rest" == *"?"* ]]; then
+      host_port="${rest%%\?*}"
+      query="${rest#*\?}"
+    else
+      host_port="$rest"
+      query=""
     fi
-    
-    nohup sing-box run -c /tmp/sb.json > /tmp/sb.log 2>&1 &
-    local pid=$!
-    echo "$pid" > /tmp/sing-box.pid
-    disown $pid 2>/dev/null || true
-    
-    sleep 4
-    
-    local code
-    code=$(curl -s --proxy socks5h://127.0.0.1:1080 --max-time 15 -o /dev/null -w "%{http_code}" "https://betadash.lunes.host/login" || true)
-    
-    if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ] || [ "$code" = "403" ]; then
-        info "✅ 代理测试通过，sing-box 保留后台运行 (PID: $pid)"
-        return 0
+    outbound_server="${host_port%:*}"
+    outbound_port="${host_port#*:}"
+    outbound_uuid="$uuid"
+    outbound_type="vless"
+    if [ -n "$query" ]; then
+      flow=$(echo "$query" | grep -o 'flow=[^&]*' | cut -d= -f2)
+      [ -n "$flow" ] && outbound_flow="$flow"
+      ttype=$(echo "$query" | grep -o 'type=[^&]*' | cut -d= -f2)
+      [ -n "$ttype" ] && outbound_transport_type="$ttype"
+      path_raw=$(echo "$query" | grep -o 'path=[^&]*' | cut -d= -f2)
+      if [ -n "$path_raw" ]; then
+        path_decoded=$(url_decode "$path_raw")
+        outbound_path="${path_decoded%%\?*}"
+      fi
+      host=$(echo "$query" | grep -o 'host=[^&]*' | cut -d= -f2)
+      [ -n "$host" ] && outbound_host="$host"
+      sec=$(echo "$query" | grep -o 'security=[^&]*' | cut -d= -f2)
+      [ -n "$sec" ] && outbound_security="$sec"
+      sni=$(echo "$query" | grep -o 'sni=[^&]*' | cut -d= -f2)
+      [ -n "$sni" ] && outbound_sni="$sni"
+      fp=$(echo "$query" | grep -o 'fp=[^&]*' | cut -d= -f2)
+      [ -n "$fp" ] && outbound_fingerprint="$fp"
+      pbk=$(echo "$query" | grep -o 'pbk=[^&]*' | cut -d= -f2)
+      [ -n "$pbk" ] && outbound_reality_pbk="$pbk"
+      sid=$(echo "$query" | grep -o 'sid=[^&]*' | cut -d= -f2)
+      [ -n "$sid" ] && outbound_reality_sid="$sid"
+      ins=$(echo "$query" | grep -o 'insecure=[^&]*' | cut -d= -f2)
+      [ "$ins" = "1" ] || [ "$ins" = "true" ] && outbound_insecure="true"
+      alins=$(echo "$query" | grep -o 'allowInsecure=[^&]*' | cut -d= -f2)
+      [ "$alins" = "1" ] || [ "$alins" = "true" ] && outbound_insecure="true"
     fi
+    [ -z "$outbound_host" ] && outbound_host="$outbound_server"
+    [ -z "$outbound_sni" ] && outbound_sni="$outbound_server"
+    ;;
+
+  vmess)
+    b64="${content}"
+    mod=$(( ${#b64} % 4 ))
+    if [ $mod -eq 2 ]; then b64="${b64}=="; elif [ $mod -eq 3 ]; then b64="${b64}="; fi
+    decoded=$(echo "$b64" | base64 -d 2>/dev/null)
+    if [ -z "$decoded" ]; then
+      echo "[ERROR] VMess 解码失败"
+      exit 1
+    fi
+    add=$(echo "$decoded" | jq -r '.add // ""')
+    port=$(echo "$decoded" | jq -r '.port // 443')
+    id=$(echo "$decoded" | jq -r '.id // ""')
+    aid=$(echo "$decoded" | jq -r '.aid // 0')
+    net=$(echo "$decoded" | jq -r '.net // "tcp"')
+    tls=$(echo "$decoded" | jq -r '.tls // ""')
+    sni=$(echo "$decoded" | jq -r '.sni // ""')
+    host=$(echo "$decoded" | jq -r '.host // ""')
+    path_raw=$(echo "$decoded" | jq -r '.path // "/"')
+    path_decoded=$(url_decode "$path_raw")
+    outbound_path="${path_decoded%%\?*}"
+    fp=$(echo "$decoded" | jq -r '.fp // "chrome"')
+    scy=$(echo "$decoded" | jq -r '.scy // "auto"')
+    outbound_type="vmess"
+    outbound_server="$add"
+    outbound_port="$port"
+    outbound_uuid="$id"
+    outbound_transport_type="$net"
+    outbound_host="${host:-$add}"
+    outbound_sni="${sni:-$add}"
+    outbound_fingerprint="$fp"
+    outbound_security="$tls"
+    outbound_flow=""
+    ;;
+
+  trojan)
+    pass_rest="${content#*://}"
+    password="${pass_rest%%@*}"
+    rest="${pass_rest#*@}"
+    if [[ "$rest" == *"?"* ]]; then
+      host_port="${rest%%\?*}"
+      query="${rest#*\?}"
+    else
+      host_port="$rest"
+      query=""
+    fi
+    outbound_server="${host_port%:*}"
+    outbound_port="${host_port#*:}"
+    outbound_password="$password"
+    outbound_type="trojan"
+    if [ -n "$query" ]; then
+      ttype=$(echo "$query" | grep -o 'type=[^&]*' | cut -d= -f2)
+      [ -n "$ttype" ] && outbound_transport_type="$ttype"
+      path_raw=$(echo "$query" | grep -o 'path=[^&]*' | cut -d= -f2)
+      if [ -n "$path_raw" ]; then
+        path_decoded=$(url_decode "$path_raw")
+        outbound_path="${path_decoded%%\?*}"
+      fi
+      host=$(echo "$query" | grep -o 'host=[^&]*' | cut -d= -f2)
+      [ -n "$host" ] && outbound_host="$host"
+      sni=$(echo "$query" | grep -o 'sni=[^&]*' | cut -d= -f2)
+      [ -n "$sni" ] && outbound_sni="$sni"
+      fp=$(echo "$query" | grep -o 'fp=[^&]*' | cut -d= -f2)
+      [ -n "$fp" ] && outbound_fingerprint="$fp"
+      ins=$(echo "$query" | grep -o 'insecure=[^&]*' | cut -d= -f2)
+      [ "$ins" = "1" ] || [ "$ins" = "true" ] && outbound_insecure="true"
+      alins=$(echo "$query" | grep -o 'allowInsecure=[^&]*' | cut -d= -f2)
+      [ "$alins" = "1" ] || [ "$alins" = "true" ] && outbound_insecure="true"
+    fi
+    [ -z "$outbound_host" ] && outbound_host="$outbound_server"
+    [ -z "$outbound_sni" ] && outbound_sni="$outbound_server"
+    ;;
+
+  hysteria2|hy2)
+    auth=""
+    if [[ "$content" == *"@"* ]]; then
+      auth="${content%%@*}"
+      host_port="${content#*@}"
+    else
+      host_port="$content"
+    fi
+    if [[ "$host_port" == *"?"* ]]; then
+      hp="${host_port%%\?*}"
+      query="${host_port#*\?}"
+    else
+      hp="$host_port"
+      query=""
+    fi
+    hp="${hp%/}"                    
+    outbound_server="${hp%:*}"
+    outbound_port="${hp#*:}"
+    outbound_type="hysteria2"
+    outbound_auth="$auth"
     
-    warn "代理测试失败 (HTTP $code)，sing-box 日志:"
-    cat /tmp/sb.log || true
-    kill $pid 2>/dev/null || true
-    wait $pid 2>/dev/null || true
-    rm -f /tmp/sing-box.pid
-    return 1
-}
-
-main() {
-    local NODE_LINK="${NODE_LINK:-}"
-    if [ -z "$NODE_LINK" ]; then
-        warn "未设置 NODE_LINK，使用直连模式"
-        echo "PROXY_SERVER=" >> "$GITHUB_ENV"
-        return 0
+    if [ -n "$query" ]; then
+      obfs=$(echo "$query" | grep -o 'obfs=[^&]*' | cut -d= -f2)
+      [ -n "$obfs" ] && outbound_obfs_password="$obfs"
+      sni=$(echo "$query" | grep -o 'sni=[^&]*' | cut -d= -f2)
+      [ -n "$sni" ] && outbound_sni="$sni"
+      fp=$(echo "$query" | grep -o 'fp=[^&]*' | cut -d= -f2)
+      [ -n "$fp" ] && outbound_fingerprint="$fp"
+      ins=$(echo "$query" | grep -o 'insecure=[^&]*' | cut -d= -f2)
+      [ "$ins" = "1" ] || [ "$ins" = "true" ] && outbound_insecure="true"
+      alins=$(echo "$query" | grep -o 'allowInsecure=[^&]*' | cut -d= -f2)
+      [ "$alins" = "1" ] || [ "$alins" = "true" ] && outbound_insecure="true"
     fi
+    [ -z "$outbound_sni" ] && outbound_sni="$outbound_server"
+    ;;
 
-    if ! get_singbox; then
-        warn "sing-box 安装失败，使用直连模式"
-        echo "PROXY_SERVER=" >> "$GITHUB_ENV"
-        return 0
+  tuic)
+    # 分离 uuid:password 部分（用 %3A 分隔）
+    uuid_pass="${content%%@*}"
+    rest="${content#*@}"
+    # 替换 %3A 为 :
+    uuid_pass_clean=$(echo "$uuid_pass" | sed 's/%3A/:/g')
+    if [[ "$uuid_pass_clean" == *":"* ]]; then
+      outbound_uuid="${uuid_pass_clean%:*}"
+      outbound_password2="${uuid_pass_clean#*:}"
+    else
+      outbound_uuid="$uuid_pass_clean"
+      outbound_password2=""
     fi
+    # 解析 host:port 和 query
+    if [[ "$rest" == *"?"* ]]; then
+      host_port="${rest%%\?*}"
+      query="${rest#*\?}"
+    else
+      host_port="$rest"
+      query=""
+    fi
+    outbound_server="${host_port%:*}"
+    outbound_port="${host_port#*:}"
+    outbound_type="tuic"
+    # 解析参数
+    if [ -n "$query" ]; then
+      sni=$(echo "$query" | grep -o 'sni=[^&]*' | cut -d= -f2)
+      [ -n "$sni" ] && outbound_sni="$sni"
+      fp=$(echo "$query" | grep -o 'fp=[^&]*' | cut -d= -f2)
+      [ -n "$fp" ] && outbound_fingerprint="$fp"
+      ins=$(echo "$query" | grep -o 'insecure=[^&]*' | cut -d= -f2)
+      [ "$ins" = "1" ] || [ "$ins" = "true" ] && outbound_insecure="true"
+      alins=$(echo "$query" | grep -o 'allowInsecure=[^&]*' | cut -d= -f2)
+      [ "$alins" = "1" ] || [ "$alins" = "true" ] && outbound_insecure="true"
+      cc=$(echo "$query" | grep -o 'congestion_control=[^&]*' | cut -d= -f2)
+      [ -n "$cc" ] && outbound_congestion="$cc"
+      alpn=$(echo "$query" | grep -o 'alpn=[^&]*' | cut -d= -f2)
+      [ -n "$alpn" ] && outbound_alpn="$alpn"
+    fi
+    [ -z "$outbound_sni" ] && outbound_sni="$outbound_server"
+    ;;
 
-    local lines=()
-    local line
-    while IFS= read -r line || [ -n "$line" ]; do
-        [ -z "$line" ] && continue
-        lines+=("$line")
-    done <<< "$NODE_LINK"
+  anytls)
+    password="${content%%@*}"
+    rest="${content#*@}"
+    if [[ "$rest" == *"?"* ]]; then
+      host_port="${rest%%\?*}"
+      query="${rest#*\?}"
+    else
+      host_port="$rest"
+      query=""
+    fi
+    outbound_server="${host_port%:*}"
+    outbound_port="${host_port#*:}"
+    outbound_password="$password"
+    outbound_type="anytls"
+    if [ -n "$query" ]; then
+      sni=$(echo "$query" | grep -o 'sni=[^&]*' | cut -d= -f2)
+      [ -n "$sni" ] && outbound_sni="$sni"
+      fp=$(echo "$query" | grep -o 'fp=[^&]*' | cut -d= -f2)
+      [ -n "$fp" ] && outbound_fingerprint="$fp"
+      ins=$(echo "$query" | grep -o 'insecure=[^&]*' | cut -d= -f2)
+      [ "$ins" = "1" ] || [ "$ins" = "true" ] && outbound_insecure="true"
+      alins=$(echo "$query" | grep -o 'allowInsecure=[^&]*' | cut -d= -f2)
+      [ "$alins" = "1" ] || [ "$alins" = "true" ] && outbound_insecure="true"
+    fi
+    [ -z "$outbound_sni" ] && outbound_sni="$outbound_server"
+    ;;
 
-    info "共检测到 ${#lines[@]} 个代理节点配置行，准备轮询测试..."
-
-    local ok=0
-    local i
-    for i in "${!lines[@]}"; do
-        line="${lines[$i]}"
-        echo "----------------------------------------"
-        info "正在尝试节点 [$((i+1)) / ${#lines[@]}] ..."
-
-        if [[ "$line" != vmess://* ]]; then
-            warn "不支持的协议: ${line:0:30}..."
-            continue
-        fi
-
-        if ! python3 -c "
-import sys, json, base64, re
-
-url = sys.argv[1]
-b64 = url.replace('vmess://', '')
-b64 = b64.replace('-', '+').replace('_', '/')
-pad = 4 - len(b64) % 4
-if pad != 4:
-    b64 += '=' * pad
-
-try:
-    data = json.loads(base64.b64decode(b64).decode('utf-8'))
-except Exception as e:
-    print(f'decode_error: {e}', file=sys.stderr)
-    sys.exit(1)
-
-srv = data.get('add', '')
-port = int(data.get('port', 0))
-uuid = data.get('id', '')
-aid = int(data.get('aid', 0))
-net = data.get('net', 'tcp')
-path = data.get('path', '/')
-host = data.get('host', '')
-tls = data.get('tls', '')
-sni = data.get('sni', '')
-
-if not srv or not port or not uuid:
-    print('missing_fields', file=sys.stderr)
-    sys.exit(1)
-
-max_early_data = 0
-early_data_header_name = ''
-m = re.search(r'^(.*?)\?ed=(\d+)$', path)
-if m:
-    path = m.group(1)
-    max_early_data = int(m.group(2))
-    early_data_header_name = 'Sec-WebSocket-Protocol'
-
-outbound = {
-    'type': 'vmess',
-    'server': srv,
-    'server_port': port,
-    'uuid': uuid,
-    'alter_id': aid,
-    'security': 'auto',
-    'packet_encoding': 'xudp',
-    'global_padding': True,
-    'tag': 'proxy'
-}
-
-if net == 'ws':
-    ws_host = host if host else srv
-    transport = {
-        'type': 'ws',
-        'path': path,
-        'headers': {'Host': ws_host}
-    }
-    if max_early_data > 0:
-        transport['max_early_data'] = max_early_data
-        transport['early_data_header_name'] = early_data_header_name
-    outbound['transport'] = transport
-
-if tls == 'tls':
-    tls_sni = sni if sni else (host if host else srv)
-    outbound['tls'] = {
-        'enabled': True,
-        'server_name': tls_sni,
-        'insecure': False
-    }
-
-config = {
-    'log': {'level': 'warn'},
-    'inbounds': [{'type': 'socks', 'listen': '127.0.0.1', 'listen_port': 1080}],
-    'outbounds': [outbound]
-}
-
-with open('/tmp/sb.json', 'w') as f:
-    json.dump(config, f, indent=2)
-
-print(f'ok {srv}:{port} path={path} ed={max_early_data}')
-" "$line"; then
-            warn "VMess 解析失败，跳过该节点"
-            continue
-        fi
-
-        if test_proxy; then
-            info "✅ 节点 [$((i+1))] 测试通过"
-            echo "PROXY_SERVER=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
-            ok=1
-            break
+  socks5|socks)
+    if [[ "$content" == *"@"* ]]; then
+      user_pass="${content%%@*}"
+      host_port="${content#*@}"
+      decoded=$(echo "$user_pass" | base64 -d 2>/dev/null || true)
+      if [ -n "$decoded" ] && [[ "$decoded" == *":"* ]]; then
+        outbound_username="${decoded%:*}"
+        outbound_password2="${decoded#*:}"
+      else
+        if [[ "$user_pass" == *":"* ]]; then
+          outbound_username="${user_pass%:*}"
+          outbound_password2="${user_pass#*:}"
         else
-            warn "❌ 节点 [$((i+1))] 连接失败"
+          outbound_username="$user_pass"
+          outbound_password2=""
         fi
-    done
-
-    if [ $ok -eq 0 ]; then
-        warn "❌ 所有配置的代理节点均测试失败，自动切换为直连模式！"
-        echo "PROXY_SERVER=" >> "$GITHUB_ENV"
-        # 清理残留的 sing-box
-        if [ -f /tmp/sing-box.pid ]; then
-            kill $(cat /tmp/sing-box.pid) 2>/dev/null || true
-            rm -f /tmp/sing-box.pid
-        fi
+      fi
+    else
+      host_port="$content"
     fi
-}
+    outbound_server="${host_port%:*}"
+    outbound_port="${host_port#*:}"
+    outbound_type="socks"
+    ;;
 
-main "$@"
+
+  *)
+    echo "[ERROR] 不支持的协议: $proto"
+    exit 1
+    ;;
+esac
+
+if [ -z "$outbound_server" ] || [ -z "$outbound_port" ]; then
+  echo "[ERROR] 无法解析服务器地址或端口"
+  exit 1
+fi
+
+# 构建 outbound 对象
+jq_outbound="{\"type\":\"$outbound_type\",\"tag\":\"proxy\",\"server\":\"$outbound_server\",\"server_port\":$outbound_port"
+
+case "$outbound_type" in
+  vless)
+    jq_outbound="$jq_outbound,\"uuid\":\"$outbound_uuid\""
+    [ -n "$outbound_flow" ] && jq_outbound="$jq_outbound,\"flow\":\"$outbound_flow\""
+    if [ "$outbound_transport_type" != "tcp" ]; then
+      jq_outbound="$jq_outbound,\"transport\":{\"type\":\"$outbound_transport_type\",\"path\":\"$outbound_path\",\"headers\":{\"Host\":\"$outbound_host\"}}"
+    fi
+    tls_enabled="false"
+    [ "$outbound_security" = "tls" ] || [ "$outbound_security" = "reality" ] && tls_enabled="true"
+    tls_json="{\"enabled\":$tls_enabled,\"server_name\":\"$outbound_sni\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$outbound_fingerprint\"}"
+    [ "$outbound_security" = "reality" ] && tls_json="$tls_json,\"reality\":{\"enabled\":true,\"public_key\":\"$outbound_reality_pbk\",\"short_id\":\"$outbound_reality_sid\"}"
+    tls_json="$tls_json}"
+    jq_outbound="$jq_outbound,\"tls\":$tls_json"
+    ;;
+  vmess)
+    jq_outbound="$jq_outbound,\"uuid\":\"$outbound_uuid\",\"security\":\"auto\""
+    jq_outbound="$jq_outbound,\"transport\":{\"type\":\"$outbound_transport_type\",\"path\":\"$outbound_path\",\"headers\":{\"Host\":\"$outbound_host\"}}"
+    tls_enabled="false"
+    [ "$outbound_security" = "tls" ] && tls_enabled="true"
+    jq_outbound="$jq_outbound,\"tls\":{\"enabled\":$tls_enabled,\"server_name\":\"$outbound_sni\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$outbound_fingerprint\"}}"
+    ;;
+  trojan)
+    jq_outbound="$jq_outbound,\"password\":\"$outbound_password\""
+    jq_outbound="$jq_outbound,\"transport\":{\"type\":\"$outbound_transport_type\",\"path\":\"$outbound_path\",\"headers\":{\"Host\":\"$outbound_host\"}}"
+    jq_outbound="$jq_outbound,\"tls\":{\"enabled\":true,\"server_name\":\"$outbound_sni\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$outbound_fingerprint\"}}"
+    ;;
+  hysteria2)
+    jq_outbound="$jq_outbound,\"up_mbps\":$outbound_up_mbps,\"down_mbps\":$outbound_down_mbps"
+    [ -n "$outbound_obfs_password" ] && jq_outbound="$jq_outbound,\"obfs\":{\"type\":\"salamander\",\"password\":\"$outbound_obfs_password\"}"
+    [ -n "$outbound_auth" ] && jq_outbound="$jq_outbound,\"password\":\"$outbound_auth\""
+    jq_outbound="$jq_outbound,\"tls\":{\"enabled\":true,\"server_name\":\"$outbound_sni\",\"insecure\":$outbound_insecure}"
+    ;;
+  tuic)
+    jq_outbound="$jq_outbound,\"uuid\":\"$outbound_uuid\""
+    [ -n "$outbound_password2" ] && jq_outbound="$jq_outbound,\"password\":\"$outbound_password2\""
+    jq_outbound="$jq_outbound,\"congestion_control\":\"$outbound_congestion\",\"udp_over_stream\":$outbound_udp_over_stream,\"zero_rtt_handshake\":$outbound_zerortt"
+    tls_json="{\"enabled\":true,\"server_name\":\"$outbound_sni\",\"insecure\":$outbound_insecure"
+    if [ -n "$outbound_alpn" ]; then
+      tls_json="$tls_json,\"alpn\":[\"$outbound_alpn\"]"
+    fi
+    tls_json="$tls_json}"
+    jq_outbound="$jq_outbound,\"tls\":$tls_json"
+    ;;
+  anytls)
+    jq_outbound="$jq_outbound,\"password\":\"$outbound_password\""
+    jq_outbound="$jq_outbound,\"tls\":{\"enabled\":true,\"server_name\":\"$outbound_sni\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$outbound_fingerprint\"}}"
+    ;;
+  socks)
+    [ -n "$outbound_username" ] && jq_outbound="$jq_outbound,\"username\":\"$outbound_username\""
+    [ -n "$outbound_password2" ] && jq_outbound="$jq_outbound,\"password\":\"$outbound_password2\""
+    jq_outbound="$jq_outbound,\"version\":\"$outbound_version\""
+    ;;
+esac
+jq_outbound="$jq_outbound}"
+
+# 生成配置（无 udp 字段）
+cat << EOF > sing-box-config.json
+{
+  "log": {"level": "warn"},
+  "inbounds": [
+    {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
+    {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 1081}
+  ],
+  "outbounds": [$jq_outbound]
+}
+EOF
+
+# echo "[DEBUG] 生成的 sing-box 配置:"
+# cat sing-box-config.json
+
+if ! jq empty sing-box-config.json 2>/dev/null; then
+  echo "[ERROR] 生成的 sing-box 配置无效"
+  # cat sing-box-config.json
+  exit 1
+fi
+
+echo "[INFO] ✅ sing-box 配置已生成"
+
+# 清理旧进程
+echo "[INFO] 清理旧进程..."
+pkill -f sing-box 2>/dev/null || true
+fuser -k 1080/tcp 2>/dev/null || true
+sleep 2
+
+./sing-box run -c sing-box-config.json > sing-box.log 2>&1 &
+sleep 5
+
+if ! pgrep -f sing-box > /dev/null; then
+  echo "[ERROR] sing-box 进程启动失败，查看日志:"
+  cat sing-box.log
+  exit 1
+fi
+
+echo "[INFO] 测试代理连接..."
+for i in {1..3}; do
+  if curl -x socks5://127.0.0.1:1080 -s --max-time 15 https://api.ipify.org > /dev/null 2>&1; then
+    echo "[INFO] ✅ 代理连接成功"
+    echo "IS_PROXY=true" >> $GITHUB_ENV
+    echo "PROXY_SERVER=socks5://127.0.0.1:1080" >> $GITHUB_ENV
+    exit 0
+  fi
+  echo "[WARN] 尝试 $i/3..."
+  sleep 3
+done
+
+echo "[ERROR] ❌ 代理连接失败"
+echo "---- sing-box 日志 ----"
+cat sing-box.log
+exit 1
