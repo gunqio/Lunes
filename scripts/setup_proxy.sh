@@ -17,19 +17,34 @@ get_singbox() {
     chmod +x /usr/local/bin/sing-box
 }
 
+# 测试代理，测试通过后保留 sing-box 后台运行
 test_proxy() {
-    sing-box run -c /tmp/sb.json > /tmp/sb.log 2>&1 &
+    # 清理可能存在的旧进程
+    if [ -f /tmp/sing-box.pid ]; then
+        kill $(cat /tmp/sing-box.pid) 2>/dev/null || true
+        rm -f /tmp/sing-box.pid
+    fi
+    
+    nohup sing-box run -c /tmp/sb.json > /tmp/sb.log 2>&1 &
     local pid=$!
-    sleep 6
+    echo "$pid" > /tmp/sing-box.pid
+    disown $pid 2>/dev/null || true
+    
+    sleep 4
+    
     local code
     code=$(curl -s --proxy socks5h://127.0.0.1:1080 --max-time 15 -o /dev/null -w "%{http_code}" "https://betadash.lunes.host/login" || true)
-    kill $pid 2>/dev/null || true
-    wait $pid 2>/dev/null || true
+    
     if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ] || [ "$code" = "403" ]; then
+        info "✅ 代理测试通过，sing-box 保留后台运行 (PID: $pid)"
         return 0
     fi
-    echo "sing-box 日志:"
+    
+    warn "代理测试失败 (HTTP $code)，sing-box 日志:"
     cat /tmp/sb.log || true
+    kill $pid 2>/dev/null || true
+    wait $pid 2>/dev/null || true
+    rm -f /tmp/sing-box.pid
     return 1
 }
 
@@ -98,7 +113,6 @@ if not srv or not port or not uuid:
     print('missing_fields', file=sys.stderr)
     sys.exit(1)
 
-# 解析 path 中的 ?ed=2560 (v2ray early data)
 max_early_data = 0
 early_data_header_name = ''
 m = re.search(r'^(.*?)\?ed=(\d+)$', path)
@@ -167,6 +181,11 @@ print(f'ok {srv}:{port} path={path} ed={max_early_data}')
     if [ $ok -eq 0 ]; then
         warn "❌ 所有配置的代理节点均测试失败，自动切换为直连模式！"
         echo "PROXY_SERVER=" >> "$GITHUB_ENV"
+        # 清理残留的 sing-box
+        if [ -f /tmp/sing-box.pid ]; then
+            kill $(cat /tmp/sing-box.pid) 2>/dev/null || true
+            rm -f /tmp/sing-box.pid
+        fi
     fi
 }
 
