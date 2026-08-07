@@ -18,14 +18,19 @@ get_singbox() {
 }
 
 test_proxy() {
-    sing-box run -c /tmp/sb.json >/dev/null 2>&1 &
+    sing-box run -c /tmp/sb.json > /tmp/sb.log 2>&1 &
     local pid=$!
-    sleep 3
+    sleep 6
     local code
-    code=$(curl -s --socks5-hostname 127.0.0.1:1080 --max-time 10 -o /dev/null -w "%{http_code}" "https://betadash.lunes.host/login" || true)
+    code=$(curl -s --proxy socks5h://127.0.0.1:1080 --max-time 15 -o /dev/null -w "%{http_code}" "https://betadash.lunes.host/login" || true)
     kill $pid 2>/dev/null || true
     wait $pid 2>/dev/null || true
-    echo "$code" | grep -qE "200|301|302|403"
+    if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ] || [ "$code" = "403" ]; then
+        return 0
+    fi
+    echo "sing-box 日志:"
+    cat /tmp/sb.log || true
+    return 1
 }
 
 main() {
@@ -64,17 +69,21 @@ main() {
         fi
 
         if ! python3 -c "
-import sys, json, base64
+import sys, json, base64, re
+
 url = sys.argv[1]
 b64 = url.replace('vmess://', '')
 b64 = b64.replace('-', '+').replace('_', '/')
 pad = 4 - len(b64) % 4
-if pad != 4: b64 += '=' * pad
+if pad != 4:
+    b64 += '=' * pad
+
 try:
     data = json.loads(base64.b64decode(b64).decode('utf-8'))
 except Exception as e:
     print(f'decode_error: {e}', file=sys.stderr)
     sys.exit(1)
+
 srv = data.get('add', '')
 port = int(data.get('port', 0))
 uuid = data.get('id', '')
@@ -84,9 +93,20 @@ path = data.get('path', '/')
 host = data.get('host', '')
 tls = data.get('tls', '')
 sni = data.get('sni', '')
+
 if not srv or not port or not uuid:
     print('missing_fields', file=sys.stderr)
     sys.exit(1)
+
+# 解析 path 中的 ?ed=2560 (v2ray early data)
+max_early_data = 0
+early_data_header_name = ''
+m = re.search(r'^(.*?)\?ed=(\d+)$', path)
+if m:
+    path = m.group(1)
+    max_early_data = int(m.group(2))
+    early_data_header_name = 'Sec-WebSocket-Protocol'
+
 outbound = {
     'type': 'vmess',
     'server': srv,
@@ -94,14 +114,23 @@ outbound = {
     'uuid': uuid,
     'alter_id': aid,
     'security': 'auto',
+    'packet_encoding': 'xudp',
+    'global_padding': True,
     'tag': 'proxy'
 }
+
 if net == 'ws':
-    outbound['transport'] = {
+    ws_host = host if host else srv
+    transport = {
         'type': 'ws',
         'path': path,
-        'headers': {'Host': host if host else srv}
+        'headers': {'Host': ws_host}
     }
+    if max_early_data > 0:
+        transport['max_early_data'] = max_early_data
+        transport['early_data_header_name'] = early_data_header_name
+    outbound['transport'] = transport
+
 if tls == 'tls':
     tls_sni = sni if sni else (host if host else srv)
     outbound['tls'] = {
@@ -109,14 +138,17 @@ if tls == 'tls':
         'server_name': tls_sni,
         'insecure': False
     }
+
 config = {
-    'log': {'level': 'error'},
+    'log': {'level': 'warn'},
     'inbounds': [{'type': 'socks', 'listen': '127.0.0.1', 'listen_port': 1080}],
     'outbounds': [outbound]
 }
+
 with open('/tmp/sb.json', 'w') as f:
     json.dump(config, f, indent=2)
-print(f'ok {srv}:{port}')
+
+print(f'ok {srv}:{port} path={path} ed={max_early_data}')
 " "$line"; then
             warn "VMess 解析失败，跳过该节点"
             continue
