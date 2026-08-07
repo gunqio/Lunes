@@ -331,7 +331,7 @@ def handle_initial_page(sb, email: str) -> Optional[str]:
             sb.wait_for_element_visible('input#email', timeout=10)
             logger.info("✅ 找到登录表单")
             return "need_login"
-        except TimeoutException:
+        except (TimeoutException, NoSuchElementException):
             logger.info(f"第 {wait_round + 1} 次等待表单超时，检查页面状态...")
             check_and_exit_on_rate_limit(sb, email)
             
