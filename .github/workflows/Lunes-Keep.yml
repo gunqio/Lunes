@@ -53,6 +53,7 @@ jobs:
           LUNES: ${{ secrets.LUNES }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PROXY_SERVER: ${{ env.PROXY_SERVER }}    # 由 setup_proxy.sh 写入格式:socks5://127.0.0.1:1080
         run: python scripts/Lunes-Keep.py
 
 #      - name: 上传截图
@@ -71,3 +72,5 @@ jobs:
           delete_workflow_pattern: ${{ github.workflow }}
           retain_days: 0
           keep_minimum_runs: 3
+
+# trigger re-index
