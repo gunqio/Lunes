@@ -168,7 +168,6 @@ def parse_single_account() -> tuple[str, str]:
 # ================== Cloudflare / Turnstile 处理 ==================
 def is_cloudflare_interstitial(sb) -> bool:
     try:
-        # 如果已经有登录表单，说明不是 CF 挑战页
         has_login_form = sb.execute_script('''
             return !!(document.querySelector('input#email')
                    || document.querySelector('input[name="email"]')
@@ -178,7 +177,6 @@ def is_cloudflare_interstitial(sb) -> bool:
         if has_login_form:
             return False
 
-        # 如果已经在 dashboard，也不是 CF 挑战
         has_dashboard = sb.execute_script('''
             return !!(document.querySelector('a.server-card')
                    || document.querySelector('.dashboard')
@@ -244,38 +242,23 @@ def bypass_cloudflare_interstitial(sb, email: str, max_attempts: int = 3) -> boo
 
 
 def wait_for_turnstile_success(sb, timeout: int = 30) -> bool:
-    """
-    Lunes 登录页 Turnstile 结构：
-    <div class="g-recaptcha" data-sitekey="..." style="margin:1rem 0;"></div>
-    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?compat=recaptcha" async defer></script>
-    
-    compat=recaptcha 模式会生成 g-recaptcha-response textarea
-    """
     logger.info("等待 Turnstile 验证...")
     start = time.time()
     while time.time() - start < timeout:
         try:
             success = sb.execute_script('''
-                // 标准 turnstile response
                 var resp = document.querySelector('input[name="cf-turnstile-response"]');
                 if (resp && resp.value && resp.value.length > 20) return true;
-                
-                // compat=recaptcha 模式生成的 textarea
                 var grecap = document.querySelector('textarea[name="g-recaptcha-response"]');
                 if (grecap && grecap.value && grecap.value.length > 20) return true;
-                
-                // 检查 iframe 是否已解决
                 var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
                 if (iframe) {
                     var style = window.getComputedStyle(iframe);
                     if (style.display === 'none' || style.visibility === 'hidden') return true;
                     if (iframe.getAttribute("data-state") === "solved") return true;
                 }
-                
-                // 检查 g-recaptcha 容器是否还在，如果消失了也算通过
                 var grec = document.querySelector('.g-recaptcha');
                 if (!grec) return true;
-                
                 return false;
             ''')
             if success:
@@ -305,12 +288,11 @@ def clear_browser_state(sb):
 
 
 def handle_initial_page(sb, email: str) -> Optional[str]:
-    clear_browser_state()
+    clear_browser_state(sb)
 
     logger.info("访问登录页...")
     sb.uc_open_with_reconnect(BETADASH_LOGIN_URL, reconnect_time=8)
     
-    # 关键：Turnstile JS 是 async defer 加载的，需要等更久
     logger.info("等待页面完全加载（Turnstile JS 异步加载中）...")
     time.sleep(8)
 
@@ -358,7 +340,6 @@ def handle_initial_page(sb, email: str) -> Optional[str]:
                 bypass_cloudflare_interstitial(sb, email, max_attempts=2)
                 time.sleep(3)
             else:
-                # 打印页面源码前 500 字符帮助调试
                 try:
                     html = sb.get_page_source()
                     logger.info(f"页面源码片段: {html[:500]}")
@@ -394,7 +375,6 @@ def fill_and_submit(sb, email: str, password: str) -> bool:
 
     logger.info("处理 Turnstile 验证码...")
     
-    # 先等 Turnstile iframe 出现（JS 异步加载）
     logger.info("等待 Turnstile 元素渲染...")
     for _ in range(10):
         has_turnstile = sb.execute_script('''
