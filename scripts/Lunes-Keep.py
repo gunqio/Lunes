@@ -165,13 +165,12 @@ def parse_single_account() -> tuple[str, str]:
         sys.exit(1)
 
 
-# ================== Cloudflare / Turnstile 处理 ==================
+# ================== Cloudflare 处理 ==================
 def is_cloudflare_interstitial(sb) -> bool:
     try:
         has_login_form = sb.execute_script('''
             return !!(document.querySelector('input#email')
                    || document.querySelector('input[name="email"]')
-                   || document.querySelector('input[type="email"]')
                    || document.querySelector('form[action*="login"]'));
         ''')
         if has_login_form:
@@ -186,7 +185,7 @@ def is_cloudflare_interstitial(sb) -> bool:
             return False
 
         page_source = sb.get_page_source()
-        title = (sb.get_title() or "").lower()
+        title = sb.get_title().lower() if sb.get_title() else ""
 
         strong_indicators = [
             "Just a moment",
@@ -252,13 +251,7 @@ def wait_for_turnstile_success(sb, timeout: int = 30) -> bool:
                 var grecap = document.querySelector('textarea[name="g-recaptcha-response"]');
                 if (grecap && grecap.value && grecap.value.length > 20) return true;
                 var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                if (iframe) {
-                    var style = window.getComputedStyle(iframe);
-                    if (style.display === 'none' || style.visibility === 'hidden') return true;
-                    if (iframe.getAttribute("data-state") === "solved") return true;
-                }
-                var grec = document.querySelector('.g-recaptcha');
-                if (!grec) return true;
+                if (iframe && iframe.getAttribute("data-state") === "solved") return true;
                 return false;
             ''')
             if success:
@@ -273,6 +266,7 @@ def wait_for_turnstile_success(sb, timeout: int = 30) -> bool:
 
 # ================== 登录流程 ==================
 def clear_browser_state(sb):
+    """清除浏览器 Cookie、localStorage、sessionStorage"""
     try:
         sb.execute_script('''
             try { window.localStorage.clear(); } catch(e) {}
@@ -292,9 +286,7 @@ def handle_initial_page(sb, email: str) -> Optional[str]:
 
     logger.info("访问登录页...")
     sb.uc_open_with_reconnect(BETADASH_LOGIN_URL, reconnect_time=8)
-    
-    logger.info("等待页面完全加载（Turnstile JS 异步加载中）...")
-    time.sleep(8)
+    time.sleep(4)
 
     check_and_exit_on_rate_limit(sb, email)
 
@@ -308,7 +300,7 @@ def handle_initial_page(sb, email: str) -> Optional[str]:
         logger.info("页面未到达登录页，尝试强制导航...")
         clear_browser_state(sb)
         sb.uc_open_with_reconnect(BETADASH_LOGIN_URL, reconnect_time=8)
-        time.sleep(8)
+        time.sleep(4)
         check_and_exit_on_rate_limit(sb, email)
         current_url = sb.get_current_url()
         logger.info(f"强制导航后URL: {mask_url(current_url)}")
@@ -326,34 +318,46 @@ def handle_initial_page(sb, email: str) -> Optional[str]:
             return "already_logged"
 
     logger.info("等待登录表单...")
-    for wait_round in range(6):
+    form_selectors = ['input#email', 'input[name="email"]', 'input[type="email"]', 'input[placeholder*="mail"]', 'input[placeholder*="邮箱"]']
+    for wait_round in range(5):
         try:
-            sb.wait_for_element_visible('input#email', timeout=10)
-            logger.info("✅ 找到登录表单")
-            return "need_login"
+            for sel in form_selectors:
+                try:
+                    sb.wait_for_element_visible(sel, timeout=8)
+                    logger.info(f"✅ 找到登录表单 ({sel})")
+                    return "need_login"
+                except (TimeoutException, NoSuchElementException):
+                    continue
+            raise TimeoutException("no form selector matched")
         except (TimeoutException, NoSuchElementException):
-            logger.info(f"第 {wait_round + 1} 次等待表单超时，检查页面状态...")
+            logger.info(f"第 {wait_round + 1}/5 次等待表单超时，检查页面状态...")
             check_and_exit_on_rate_limit(sb, email)
-            
             if is_cloudflare_interstitial(sb):
                 logger.info("表单等待期间出现 CF 挑战")
                 bypass_cloudflare_interstitial(sb, email, max_attempts=2)
                 time.sleep(3)
             else:
+                # Try reconnect
+                logger.info("尝试重新加载页面...")
                 try:
-                    html = sb.get_page_source()
-                    logger.info(f"页面源码片段: {html[:500]}")
+                    sb.uc_open_with_reconnect(BETADASH_LOGIN_URL, reconnect_time=10)
+                    time.sleep(5)
                 except:
-                    pass
-                time.sleep(3)
+                    time.sleep(3)
 
     sp = screenshot_path("02-no-form")
     safe_screenshot(sb, sp)
-    logger.error("未找到登录表单")
+    # Dump page source snippet for debugging
+    try:
+        page_src = sb.get_page_source()[:500]
+        logger.error(f"未找到登录表单，页面片段: {page_src}")
+    except:
+        logger.error("未找到登录表单")
     return None
 
 
 def fill_and_submit(sb, email: str, password: str) -> bool:
+    """填写登录表单并提交"""
     logger.info("填写登录信息...")
 
     try:
@@ -374,21 +378,6 @@ def fill_and_submit(sb, email: str, password: str) -> bool:
     safe_screenshot(sb, sp)
 
     logger.info("处理 Turnstile 验证码...")
-    
-    logger.info("等待 Turnstile 元素渲染...")
-    for _ in range(10):
-        has_turnstile = sb.execute_script('''
-            return !!(document.querySelector('.g-recaptcha') 
-                   || document.querySelector('iframe[src*="challenges.cloudflare.com"]')
-                   || document.querySelector('input[name="cf-turnstile-response"]'));
-        ''')
-        if has_turnstile:
-            logger.info("✅ Turnstile 元素已出现")
-            break
-        time.sleep(1)
-    else:
-        logger.warning("Turnstile 元素未出现，尝试继续...")
-
     already_done = wait_for_turnstile_success(sb, timeout=5)
     if already_done:
         logger.info("Turnstile 已自动完成，直接提交")
@@ -400,7 +389,7 @@ def fill_and_submit(sb, email: str, password: str) -> bool:
                 logger.info(f"点击验证码第 {click_attempt + 1} 次")
             except Exception as e:
                 logger.warning(f"点击验证码异常 (第 {click_attempt + 1} 次): {e}")
-            time.sleep(3)
+            time.sleep(2)
             if wait_for_turnstile_success(sb, timeout=10):
                 break
         else:
@@ -411,7 +400,7 @@ def fill_and_submit(sb, email: str, password: str) -> bool:
 
     logger.info("提交登录...")
     submitted = False
-    for selector in ['button[type="submit"]', '.submit-btn']:
+    for selector in ['button.submit-btn', 'button[type="submit"]']:
         try:
             sb.click(selector)
             submitted = True
@@ -569,6 +558,7 @@ def betadash_login(
     proxy: Optional[str] = None,
     max_retries: int = 1,
 ) -> dict:
+    """执行登录并保活，仅在未触发速率限制时运行一次"""
     result = {"success": False, "message": "", "screenshot": None}
 
     logger.info("=" * 50)
